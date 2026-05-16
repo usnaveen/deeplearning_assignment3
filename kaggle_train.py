@@ -140,7 +140,6 @@ def train_model(model, train_loader, val_loader, test_loader, tgt_vocab,
 # ===================== EXPERIMENTS =====================
 
 def experiment_main(cfg, device, wandb_module):
-    """Main training run + best checkpoint."""
     print("\n" + "="*60)
     print("MAIN TRAINING RUN")
     print("="*60)
@@ -158,41 +157,42 @@ def experiment_main(cfg, device, wandb_module):
 
 
 def experiment_2_1(cfg, device, wandb_module):
-    """Noam Scheduler vs Fixed LR."""
     print("\n" + "="*60)
-    print("EXPERIMENT 2.1: Noam vs Fixed LR")
+    print("EXPERIMENT 2.1: Noam vs Fixed LR (with LR Tracking)")
     print("="*60)
     run = wandb_module.init(project="da6401-a3", name="exp2.1_noam_vs_fixed", config=cfg, reinit=True)
     train_loader, val_loader, test_loader, src_vocab, tgt_vocab = get_dataloaders(cfg)
 
-    # --- Run A: Noam ---
     model_a = build_model(len(src_vocab), len(tgt_vocab), cfg, device)
     opt_a = torch.optim.Adam(model_a.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9)
     sched_a = NoamScheduler(opt_a, d_model=cfg["d_model"], warmup_steps=cfg["warmup_steps"])
     loss_a = LabelSmoothingLoss(len(tgt_vocab), PAD_IDX, 0.1)
-    for ep in range(1, cfg["epochs"] + 1):
-        tl = run_epoch(train_loader, model_a, loss_a, opt_a, sched_a, ep, True, device)
-        vl = run_epoch(val_loader, model_a, loss_a, None, None, ep, False, device)
-        run.log({"epoch": ep, "noam/train_loss": tl, "noam/val_loss": vl})
-        print(f"[noam] ep={ep} tl={tl:.4f} vl={vl:.4f}")
-
-    # --- Run B: Fixed LR ---
+    
     model_b = build_model(len(src_vocab), len(tgt_vocab), cfg, device)
     opt_b = torch.optim.Adam(model_b.parameters(), lr=1e-4, betas=(0.9, 0.98), eps=1e-9)
     loss_b = LabelSmoothingLoss(len(tgt_vocab), PAD_IDX, 0.1)
-    for ep in range(1, cfg["epochs"] + 1):
-        tl = run_epoch(train_loader, model_b, loss_b, opt_b, None, ep, True, device)
-        vl = run_epoch(val_loader, model_b, loss_b, None, None, ep, False, device)
-        run.log({"epoch": ep, "fixed/train_loss": tl, "fixed/val_loss": vl})
-        print(f"[fixed] ep={ep} tl={tl:.4f} vl={vl:.4f}")
 
+    for ep in range(1, cfg["epochs"] + 1):
+        tl_a = run_epoch(train_loader, model_a, loss_a, opt_a, sched_a, ep, True, device)
+        vl_a = run_epoch(val_loader, model_a, loss_a, None, None, ep, False, device)
+        lr_a = opt_a.param_groups[0]['lr']
+        
+        tl_b = run_epoch(train_loader, model_b, loss_b, opt_b, None, ep, True, device)
+        vl_b = run_epoch(val_loader, model_b, loss_b, None, None, ep, False, device)
+        lr_b = opt_b.param_groups[0]['lr']
+        
+        run.log({
+            "epoch": ep,
+            "noam/train_loss": tl_a, "noam/val_loss": vl_a, "noam/learning_rate": lr_a,
+            "fixed/train_loss": tl_b, "fixed/val_loss": vl_b, "fixed/learning_rate": lr_b
+        })
+        print(f"[noam] ep={ep} vl={vl_a:.4f} lr={lr_a:.6f} | [fixed] vl={vl_b:.4f} lr={lr_b:.6f}")
     run.finish()
 
 
 def experiment_2_2(cfg, device, wandb_module):
-    """Scaling Factor 1/sqrt(dk) ablation + gradient norms."""
     print("\n" + "="*60)
-    print("EXPERIMENT 2.2: Scaling Factor Ablation")
+    print("EXPERIMENT 2.2: Scaling Factor Ablation (with Entropy)")
     print("="*60)
     import model as model_module
     original_attn = model_module.scaled_dot_product_attention
@@ -210,50 +210,72 @@ def experiment_2_2(cfg, device, wandb_module):
         for ep in range(1, min(cfg["epochs"], 5) + 1):
             model.train()
             for src, tgt in train_loader:
-                if step >= 1000:
-                    break
+                if step >= 1000: break
                 src, tgt = src.to(device), tgt.to(device)
                 tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
                 opt.zero_grad(set_to_none=True)
                 logits = model(src, tgt_in, make_src_mask(src, PAD_IDX), make_tgt_mask(tgt_in, PAD_IDX))
                 loss = loss_fn(logits.reshape(-1, logits.size(-1)), tgt_out.reshape(-1))
                 loss.backward()
-                # Log gradient norms for Q and K weights
+                
+                # Gradients & Entropy
                 q_norms, k_norms = [], []
                 for name, param in model.named_parameters():
                     if param.grad is not None:
-                        if "W_q" in name:
-                            q_norms.append(param.grad.norm().item())
-                        elif "W_k" in name:
-                            k_norms.append(param.grad.norm().item())
+                        if "W_q" in name: q_norms.append(param.grad.norm().item())
+                        elif "W_k" in name: k_norms.append(param.grad.norm().item())
+                        
+                attn_weights = model.encoder.layers[-1].self_attn.attn_weights
+                # Entropy = -sum(p * log(p))
+                entropy = -torch.sum(attn_weights * torch.log(attn_weights + 1e-9), dim=-1).mean().item()
+                
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
                 sched.step()
                 step += 1
+                
                 if step <= 1000:
                     run.log({
                         "step": step,
                         f"{variant}/loss": loss.item(),
                         f"{variant}/grad_norm_Q": np.mean(q_norms) if q_norms else 0,
                         f"{variant}/grad_norm_K": np.mean(k_norms) if k_norms else 0,
+                        f"{variant}/attention_entropy": entropy
                     })
-            if step >= 1000:
-                break
-        print(f"[{variant}] logged {step} steps of gradient norms")
+            if step >= 1000: break
+        print(f"[{variant}] logged {step} steps")
 
     model_module.scaled_dot_product_attention = original_attn
     run.finish()
 
 
-def experiment_2_3(cfg, device, wandb_module, checkpoint_path):
-    """Attention Rollout & Head Specialization heatmaps."""
-    print("\n" + "="*60)
-    print("EXPERIMENT 2.3: Attention Heatmaps")
-    print("="*60)
+def save_heatmap(attn, src_tokens, tgt_tokens, filename, title):
     import matplotlib
     matplotlib.use("Agg")
     import matplotlib.pyplot as plt
+    num_heads = attn.shape[0]
+    fig, axes = plt.subplots(2, (num_heads + 1) // 2, figsize=(4 * ((num_heads + 1) // 2), 8))
+    axes = axes.flatten()
+    for h in range(num_heads):
+        ax = axes[h]
+        im = ax.imshow(attn[h], cmap="viridis", aspect="auto")
+        ax.set_title(f"Head {h}")
+        ax.set_xticks(range(len(tgt_tokens)))
+        ax.set_yticks(range(len(src_tokens)))
+        ax.set_xticklabels(tgt_tokens, rotation=90, fontsize=6)
+        ax.set_yticklabels(src_tokens, fontsize=6)
+    for h in range(num_heads, len(axes)):
+        axes[h].axis("off")
+    plt.suptitle(title)
+    plt.tight_layout()
+    plt.savefig(filename, dpi=150)
+    plt.close()
 
+
+def experiment_2_3(cfg, device, wandb_module, checkpoint_path):
+    print("\n" + "="*60)
+    print("EXPERIMENT 2.3: Layer Progression & Cross Attention Heatmaps")
+    print("="*60)
     run = wandb_module.init(project="da6401-a3", name="exp2.3_attention", config=cfg, reinit=True)
     train_loader, val_loader, test_loader, src_vocab, tgt_vocab = get_dataloaders(cfg)
 
@@ -261,53 +283,79 @@ def experiment_2_3(cfg, device, wandb_module, checkpoint_path):
     load_checkpoint(checkpoint_path, model)
     model.eval()
 
-    # Get a sample batch
     src_batch, tgt_batch = next(iter(test_loader))
     src_i = src_batch[0:1].to(device)
+    tgt_i = tgt_batch[0:1].to(device)
+    tgt_in = tgt_i[:, :-1]
+    
     src_mask = make_src_mask(src_i, PAD_IDX)
+    tgt_mask = make_tgt_mask(tgt_in, PAD_IDX)
 
     with torch.no_grad():
-        _ = model.encode(src_i, src_mask)
+        _ = model(src_i, tgt_in, src_mask, tgt_mask)
 
-    # Extract attention weights from last encoder layer
-    last_enc_layer = model.encoder.layers[-1]
-    attn_weights = last_enc_layer.self_attn.attn_weights  # [1, heads, seq, seq]
-    if attn_weights is None:
-        print("WARNING: No attention weights captured")
-        run.finish()
-        return
-
-    attn = attn_weights.squeeze(0).cpu().numpy()  # [heads, seq, seq]
-    num_heads = attn.shape[0]
     src_tokens = src_vocab.decode(src_i.squeeze(0).tolist(), remove_specials=False)
-    seq_len = min(len(src_tokens), attn.shape[1])
-    src_tokens = src_tokens[:seq_len]
+    tgt_tokens = tgt_vocab.decode(tgt_in.squeeze(0).tolist(), remove_specials=False)
+    
+    # Encoder Layer 1 (Local)
+    attn_enc_1 = model.encoder.layers[0].self_attn.attn_weights.squeeze(0).cpu().numpy()
+    seq_len = min(len(src_tokens), attn_enc_1.shape[1])
+    save_heatmap(attn_enc_1[:, :seq_len, :seq_len], src_tokens[:seq_len], src_tokens[:seq_len], 
+                 "enc_layer1.png", "Encoder Layer 1 (Self Attention)")
+                 
+    # Encoder Layer 3 (Global)
+    attn_enc_3 = model.encoder.layers[-1].self_attn.attn_weights.squeeze(0).cpu().numpy()
+    save_heatmap(attn_enc_3[:, :seq_len, :seq_len], src_tokens[:seq_len], src_tokens[:seq_len], 
+                 "enc_layer3.png", f"Encoder Layer {cfg['layers']} (Self Attention)")
+                 
+    # Decoder Cross Attention
+    attn_cross = model.decoder.layers[-1].src_attn.attn_weights.squeeze(0).cpu().numpy()
+    save_heatmap(attn_cross[:, :len(tgt_tokens), :seq_len], tgt_tokens, src_tokens[:seq_len], 
+                 "cross_attn.png", "Decoder -> Encoder Cross Attention")
 
-    fig, axes = plt.subplots(2, (num_heads + 1) // 2, figsize=(4 * ((num_heads + 1) // 2), 8))
-    axes = axes.flatten()
-    for h in range(num_heads):
-        ax = axes[h]
-        im = ax.imshow(attn[h, :seq_len, :seq_len], cmap="viridis", aspect="auto")
-        ax.set_title(f"Head {h}")
-        ax.set_xticks(range(seq_len))
-        ax.set_yticks(range(seq_len))
-        ax.set_xticklabels(src_tokens, rotation=90, fontsize=6)
-        ax.set_yticklabels(src_tokens, fontsize=6)
-    for h in range(num_heads, len(axes)):
-        axes[h].axis("off")
-    plt.suptitle("Encoder Last Layer — Per-Head Attention")
-    plt.tight_layout()
-    plt.savefig("attention_heatmaps.png", dpi=150)
-    run.log({"attention_heatmaps": wandb_module.Image("attention_heatmaps.png")})
-    plt.close()
-    print("Logged attention heatmaps")
+    run.log({
+        "encoder_layer_1": wandb_module.Image("enc_layer1.png"),
+        "encoder_layer_3": wandb_module.Image("enc_layer3.png"),
+        "decoder_cross_attn": wandb_module.Image("cross_attn.png"),
+    })
+    print("Logged 3 advanced heatmaps!")
     run.finish()
 
 
+def evaluate_bucketed_bleu(model, test_loader, tgt_vocab, device):
+    from train import greedy_decode, _tokens_from_vocab, _corpus_bleu
+    buckets = {"short (<10)": (0, 10), "medium (10-20)": (10, 20), "long (>20)": (20, 999)}
+    refs = {k: [] for k in buckets}
+    hyps = {k: [] for k in buckets}
+    
+    for src, tgt in test_loader:
+        for i in range(src.size(0)):
+            src_i = src[i:i+1].to(device)
+            # Find true length without padding
+            length = (src_i[0] != PAD_IDX).sum().item()
+            
+            bucket_name = None
+            for name, (low, high) in buckets.items():
+                if low <= length < high:
+                    bucket_name = name
+                    break
+            if not bucket_name: continue
+                
+            src_mask = make_src_mask(src_i, PAD_IDX)
+            pred = greedy_decode(model, src_i, src_mask, 100, SOS_IDX, EOS_IDX, device=device)
+            hyps[bucket_name].append(_tokens_from_vocab(tgt_vocab, pred.squeeze(0).tolist()))
+            refs[bucket_name].append(_tokens_from_vocab(tgt_vocab, tgt[i].tolist()))
+            
+    scores = {}
+    for name in buckets:
+        if len(refs[name]) > 0:
+            scores[name] = _corpus_bleu(refs[name], hyps[name])
+    return scores
+
+
 def experiment_2_4(cfg, device, wandb_module):
-    """Sinusoidal vs Learned Positional Encoding."""
     print("\n" + "="*60)
-    print("EXPERIMENT 2.4: Sinusoidal vs Learned PE")
+    print("EXPERIMENT 2.4: Bucketed BLEU Extrapolation")
     print("="*60)
     run = wandb_module.init(project="da6401-a3", name="exp2.4_pe", config=cfg, reinit=True)
     train_loader, val_loader, test_loader, src_vocab, tgt_vocab = get_dataloaders(cfg)
@@ -318,29 +366,24 @@ def experiment_2_4(cfg, device, wandb_module):
         sched = NoamScheduler(opt, d_model=cfg["d_model"], warmup_steps=cfg["warmup_steps"])
         loss_fn = LabelSmoothingLoss(len(tgt_vocab), PAD_IDX, 0.1)
 
-        best_val = float("inf")
         for ep in range(1, cfg["epochs"] + 1):
             tl = run_epoch(train_loader, model, loss_fn, opt, sched, ep, True, device)
             vl = run_epoch(val_loader, model, loss_fn, None, None, ep, False, device)
             log = {"epoch": ep, f"{variant}/train_loss": tl, f"{variant}/val_loss": vl}
-            if vl < best_val:
-                best_val = vl
-                save_checkpoint(model, opt, sched, ep, f"ckpt_{variant}.pt")
-            if ep % 3 == 0 or ep == cfg["epochs"]:
-                bleu = evaluate_bleu(model, val_loader, tgt_vocab, device=device)
-                log[f"{variant}/val_bleu"] = bleu
-                print(f"[{variant}] ep={ep} tl={tl:.4f} vl={vl:.4f} bleu={bleu:.2f}")
-            else:
-                print(f"[{variant}] ep={ep} tl={tl:.4f} vl={vl:.4f}")
+            
+            if ep == cfg["epochs"]:
+                scores = evaluate_bucketed_bleu(model, test_loader, tgt_vocab, device)
+                for bucket, score in scores.items():
+                    log[f"{variant}/bleu_{bucket}"] = score
+                    print(f"[{variant}] bucket {bucket} BLEU = {score:.2f}")
+            print(f"[{variant}] ep={ep} tl={tl:.4f} vl={vl:.4f}")
             run.log(log)
-
     run.finish()
 
 
 def experiment_2_5(cfg, device, wandb_module):
-    """Label Smoothing ablation: eps=0.1 vs eps=0.0."""
     print("\n" + "="*60)
-    print("EXPERIMENT 2.5: Label Smoothing Ablation")
+    print("EXPERIMENT 2.5: Label Smoothing (with Output Entropy)")
     print("="*60)
     run = wandb_module.init(project="da6401-a3", name="exp2.5_label_smooth", config=cfg, reinit=True)
     train_loader, val_loader, test_loader, src_vocab, tgt_vocab = get_dataloaders(cfg)
@@ -352,9 +395,8 @@ def experiment_2_5(cfg, device, wandb_module):
         loss_fn = LabelSmoothingLoss(len(tgt_vocab), PAD_IDX, smoothing=eps)
 
         for ep in range(1, cfg["epochs"] + 1):
-            # Train with confidence logging
             model.train()
-            total_conf, total_tok = 0.0, 0
+            total_conf, total_ent, total_tok = 0.0, 0.0, 0
             for src, tgt in train_loader:
                 src, tgt = src.to(device), tgt.to(device)
                 tgt_in, tgt_out = tgt[:, :-1], tgt[:, 1:]
@@ -365,7 +407,7 @@ def experiment_2_5(cfg, device, wandb_module):
                 torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                 opt.step()
                 sched.step()
-                # Prediction confidence
+                
                 with torch.no_grad():
                     probs = torch.softmax(logits, dim=-1)
                     flat_probs = probs.reshape(-1, probs.size(-1))
@@ -374,21 +416,83 @@ def experiment_2_5(cfg, device, wandb_module):
                     if non_pad.sum() > 0:
                         correct_probs = flat_probs[torch.arange(flat_probs.size(0), device=device), flat_tgt]
                         total_conf += correct_probs[non_pad].sum().item()
+                        
+                        # Output Entropy
+                        ent = -torch.sum(flat_probs[non_pad] * torch.log(flat_probs[non_pad] + 1e-9), dim=-1)
+                        total_ent += ent.sum().item()
                         total_tok += non_pad.sum().item()
 
             avg_conf = total_conf / max(total_tok, 1)
+            avg_ent = total_ent / max(total_tok, 1)
             vl = run_epoch(val_loader, model, loss_fn, None, None, ep, False, device)
-            run.log({"epoch": ep, f"{variant}/val_loss": vl, f"{variant}/pred_confidence": avg_conf})
-            print(f"[{variant}] ep={ep} vl={vl:.4f} conf={avg_conf:.4f}")
-
+            
+            run.log({"epoch": ep, f"{variant}/val_loss": vl, f"{variant}/pred_confidence": avg_conf, f"{variant}/output_entropy": avg_ent})
+            print(f"[{variant}] ep={ep} vl={vl:.4f} conf={avg_conf:.4f} ent={avg_ent:.4f}")
     run.finish()
 
 
-# ---------------------------------------------------------------------------
+def experiment_bonus_1(cfg, device, wandb_module):
+    print("\n" + "="*60)
+    print("BONUS 1: Multi-Head Scaling")
+    print("="*60)
+    run = wandb_module.init(project="da6401-a3", name="bonus1_multi_head", config=cfg, reinit=True)
+    train_loader, val_loader, test_loader, src_vocab, tgt_vocab = get_dataloaders(cfg)
+
+    for heads in [1, 4, 8]:
+        variant = f"heads_{heads}"
+        cfg_mod = cfg.copy()
+        cfg_mod["heads"] = heads
+        
+        model = build_model(len(src_vocab), len(tgt_vocab), cfg_mod, device)
+        opt = torch.optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9)
+        sched = NoamScheduler(opt, d_model=cfg_mod["d_model"], warmup_steps=cfg_mod["warmup_steps"])
+        loss_fn = LabelSmoothingLoss(len(tgt_vocab), PAD_IDX, smoothing=0.1)
+
+        for ep in range(1, 11): # Train for 10 epochs to save time
+            tl = run_epoch(train_loader, model, loss_fn, opt, sched, ep, True, device)
+            vl = run_epoch(val_loader, model, loss_fn, None, None, ep, False, device)
+            log = {"epoch": ep, f"{variant}/train_loss": tl, f"{variant}/val_loss": vl}
+            if ep == 10:
+                bleu = evaluate_bleu(model, val_loader, tgt_vocab, device=device)
+                log[f"{variant}/val_bleu"] = bleu
+                print(f"[{variant}] ep={ep} val_bleu={bleu:.2f}")
+            run.log(log)
+    run.finish()
+
+
+def experiment_bonus_2(cfg, device, wandb_module):
+    print("\n" + "="*60)
+    print("BONUS 2: Depth Scaling")
+    print("="*60)
+    run = wandb_module.init(project="da6401-a3", name="bonus2_depth", config=cfg, reinit=True)
+    train_loader, val_loader, test_loader, src_vocab, tgt_vocab = get_dataloaders(cfg)
+
+    for layers in [1, 3, 6]:
+        variant = f"layers_{layers}"
+        cfg_mod = cfg.copy()
+        cfg_mod["layers"] = layers
+        
+        model = build_model(len(src_vocab), len(tgt_vocab), cfg_mod, device)
+        opt = torch.optim.Adam(model.parameters(), lr=1.0, betas=(0.9, 0.98), eps=1e-9)
+        sched = NoamScheduler(opt, d_model=cfg_mod["d_model"], warmup_steps=cfg_mod["warmup_steps"])
+        loss_fn = LabelSmoothingLoss(len(tgt_vocab), PAD_IDX, smoothing=0.1)
+
+        for ep in range(1, 11):
+            tl = run_epoch(train_loader, model, loss_fn, opt, sched, ep, True, device)
+            vl = run_epoch(val_loader, model, loss_fn, None, None, ep, False, device)
+            log = {"epoch": ep, f"{variant}/train_loss": tl, f"{variant}/val_loss": vl}
+            if ep == 10:
+                bleu = evaluate_bleu(model, val_loader, tgt_vocab, device=device)
+                log[f"{variant}/val_bleu"] = bleu
+                print(f"[{variant}] ep={ep} val_bleu={bleu:.2f}")
+            run.log(log)
+    run.finish()
+
+
 def main():
+    import argparse, os, wandb
     parser = argparse.ArgumentParser()
-    parser.add_argument("--wandb-key", type=str, default=None,
-                        help="W&B API key. Auto-detected from Kaggle secrets / env / existing login if omitted.")
+    parser.add_argument("--wandb-key", type=str, default=None)
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--d-model", type=int, default=256)
@@ -399,28 +503,21 @@ def main():
     parser.add_argument("--warmup-steps", type=int, default=4000)
     parser.add_argument("--min-freq", type=int, default=2)
     parser.add_argument("--skip-main", action="store_true")
-    parser.add_argument("--only", type=str, default=None, help="Run only this experiment: main,2.1,2.2,2.3,2.4,2.5")
+    parser.add_argument("--only", type=str, default=None)
     args = parser.parse_args()
 
-    import wandb
-    # Try: CLI arg → Kaggle secret → env var → existing login
     key = args.wandb_key
-    if key is None:
-        key = os.environ.get("WANDB_API_KEY")
+    if key is None: key = os.environ.get("WANDB_API_KEY")
     if key is None:
         try:
             from kaggle_secrets import UserSecretsClient
             key = UserSecretsClient().get_secret("WANDB_API_KEY")
-        except Exception:
-            pass
-    if key:
-        wandb.login(key=key)
-    else:
-        wandb.login()  # uses existing credentials
+        except: pass
+    if key: wandb.login(key=key)
+    else: wandb.login()
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
-    print(f"Device: {device}")
-
+    
     cfg = {
         "epochs": args.epochs, "batch_size": args.batch_size,
         "d_model": args.d_model, "layers": args.layers,
@@ -434,26 +531,19 @@ def main():
         "main": lambda: experiment_main(cfg, device, wandb),
         "2.1": lambda: experiment_2_1(cfg, device, wandb),
         "2.2": lambda: experiment_2_2(cfg, device, wandb),
-        "2.3": lambda: experiment_2_3(cfg, device, wandb, "checkpoint_main.pt"),
+        "2.3": lambda: experiment_2_3(cfg, device, wandb, "checkpoint.pt"),
         "2.4": lambda: experiment_2_4(cfg, device, wandb),
         "2.5": lambda: experiment_2_5(cfg, device, wandb),
+        "bonus1": lambda: experiment_bonus_1(cfg, device, wandb),
+        "bonus2": lambda: experiment_bonus_2(cfg, device, wandb),
     }
 
-    if args.only:
-        keys = [k.strip() for k in args.only.split(",")]
-    else:
-        keys = list(experiments.keys())
-        if args.skip_main:
-            keys.remove("main")
+    keys = [k.strip() for k in args.only.split(",")] if args.only else list(experiments.keys())
+    if args.skip_main and "main" in keys: keys.remove("main")
 
     for k in keys:
-        if k in experiments:
-            experiments[k]()
-        else:
-            print(f"Unknown experiment: {k}")
-
-    print("\n✅ All experiments complete!")
-
+        if k in experiments: experiments[k]()
+        else: print(f"Unknown: {k}")
 
 if __name__ == "__main__":
     main()
