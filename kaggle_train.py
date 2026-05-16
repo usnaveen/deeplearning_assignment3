@@ -309,7 +309,7 @@ def experiment_2_3(cfg, device, wandb_module, checkpoint_path):
                  "enc_layer3.png", f"Encoder Layer {cfg['layers']} (Self Attention)")
                  
     # Decoder Cross Attention
-    attn_cross = model.decoder.layers[-1].src_attn.attn_weights.squeeze(0).cpu().numpy()
+    attn_cross = model.decoder.layers[-1].cross_attn.attn_weights.squeeze(0).cpu().numpy()
     save_heatmap(attn_cross[:, :len(tgt_tokens), :seq_len], tgt_tokens, src_tokens[:seq_len], 
                  "cross_attn.png", "Decoder -> Encoder Cross Attention")
 
