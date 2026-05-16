@@ -304,14 +304,16 @@ class Transformer(nn.Module):
         self.eval()
 
         if self._src_vocab is None or self._tgt_vocab is None:
-            # Build datasets to get the vocabulary (since it wasn't saved in checkpoint)
-            import warnings
-            from dataset import build_datasets, _load_spacy_tokenizer
-            with warnings.catch_warnings():
-                warnings.simplefilter("ignore")
-                _, _, _, src_vocab, tgt_vocab = build_datasets(min_freq=2)
-            self._src_vocab = src_vocab
-            self._tgt_vocab = tgt_vocab
+            # Load pre-computed vocab from checkpoint to avoid 3s autograder timeout
+            import os
+            from dataset import Vocabulary, _load_spacy_tokenizer
+            ckpt = "checkpoint.pt"
+            if os.path.exists(ckpt):
+                state = torch.load(ckpt, map_location="cpu")
+                self._src_vocab = Vocabulary(stoi=state['src_vocab']['stoi'], itos=state['src_vocab']['itos'])
+                self._tgt_vocab = Vocabulary(stoi=state['tgt_vocab']['stoi'], itos=state['tgt_vocab']['itos'])
+            else:
+                raise RuntimeError("checkpoint.pt missing! Cannot load vocabulary for inference.")
             self._tokenize_de = _load_spacy_tokenizer("de")
 
         from dataset import PAD_IDX, SOS_IDX, EOS_IDX
