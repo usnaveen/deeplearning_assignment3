@@ -72,6 +72,7 @@ def build_model(src_vocab_size, tgt_vocab_size, cfg, device, use_learned_pe=Fals
         d_model=cfg["d_model"], N=cfg["layers"],
         num_heads=cfg["heads"], d_ff=cfg["d_ff"],
         dropout=cfg["dropout"],
+        checkpoint_path="", # Prevent auto-loading main checkpoint during ablations
     ).to(device)
 
     if use_learned_pe:
