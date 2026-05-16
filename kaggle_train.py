@@ -387,7 +387,8 @@ def experiment_2_5(cfg, device, wandb_module):
 # ---------------------------------------------------------------------------
 def main():
     parser = argparse.ArgumentParser()
-    parser.add_argument("--wandb-key", type=str, required=True)
+    parser.add_argument("--wandb-key", type=str, default=None,
+                        help="W&B API key. Auto-detected from Kaggle secrets / env / existing login if omitted.")
     parser.add_argument("--epochs", type=int, default=15)
     parser.add_argument("--batch-size", type=int, default=64)
     parser.add_argument("--d-model", type=int, default=256)
@@ -402,7 +403,20 @@ def main():
     args = parser.parse_args()
 
     import wandb
-    wandb.login(key=args.wandb_key)
+    # Try: CLI arg → Kaggle secret → env var → existing login
+    key = args.wandb_key
+    if key is None:
+        key = os.environ.get("WANDB_API_KEY")
+    if key is None:
+        try:
+            from kaggle_secrets import UserSecretsClient
+            key = UserSecretsClient().get_secret("WANDB_API_KEY")
+        except Exception:
+            pass
+    if key:
+        wandb.login(key=key)
+    else:
+        wandb.login()  # uses existing credentials
 
     device = "cuda" if torch.cuda.is_available() else "cpu"
     print(f"Device: {device}")
